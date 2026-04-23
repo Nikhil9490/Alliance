@@ -1,6 +1,28 @@
 # Alliance — HCP ↔ Notion Sync
 
-Two-way sync between Housecall Pro (HCP) and a Notion jobs database. Runs as a polling script — no server required.
+Two-way sync between Housecall Pro (HCP) and Notion. Runs as a polling script — no server required.
+
+---
+
+## Current Status
+
+### Done
+- [x] Jobs: full HCP → Notion sync (320 jobs, all pages)
+- [x] Jobs: Notion → HCP create (new Notion row → HCP job)
+- [x] Jobs: Notion → HCP schedule update (`Job scheduled start date`)
+- [x] Jobs: Notion → HCP note add (`Last Job Note`)
+- [x] Jobs: deletion sync both directions
+- [x] Stage mapping (raw HCP values → clean Notion select names)
+- [x] Business hours enforcement (9 AM – 5 PM ET)
+- [x] Two-interval polling: page-1 every 5 min, full scan every 60 min
+- [x] HCP 429 rate limit handling (`RateLimit-Reset` header + retry)
+- [x] Loop prevention via `sync_state.json` timestamp
+
+### Next — Phase 2
+- [ ] Leads DB: new Notion database synced from HCP `/leads`
+- [ ] Estimates DB: new Notion database synced from HCP `/estimates`
+- [ ] Link Estimates → Customers (relation)
+- [ ] Link Jobs → Estimates (relation)
 
 ---
 
@@ -22,40 +44,17 @@ Alliance/
 ## Environment Variables (.env)
 
 ```
-HCP_API_KEY=...                          # Housecall Pro API key
-NOTION_TOKEN=...                         # Notion integration token
-NOTION_DATABASE_ID_JOBS=...              # UUID of the Notion jobs database
-JOBS_URL=...                             # Notion DB URL (not used in code, reference only)
+HCP_API_KEY=...                    # Housecall Pro API key (Token auth)
+NOTION_TOKEN=...                   # Notion integration token
+NOTION_DATABASE_ID_JOBS=...        # UUID of Notion jobs database
+JOBS_URL=...                       # Notion DB URL (reference only)
 ```
 
----
-
-## Notion Database Columns
-
-The Notion DB must have these exact column names and types:
-
-| Column | Type | Source |
-|--------|------|--------|
-| `Job #` | Title | `invoice_number` |
-| `Job ID` | Text | `id` — used as dedup key |
-| `Customer Name` | Text | `customer.first_name + last_name` |
-| `Phone` | Phone | `customer.mobile_number` |
-| `Address` | Text | `address.street, city, state, zip` |
-| `Job status` | Text | `work_status` |
-| `Stages` | Select | `work_status` |
-| `Job Type` | Select | `job_fields.job_type.name` |
-| `Job scheduled start date` | Date | `schedule.scheduled_start` |
-| `Job created date` | Date | `created_at` |
-| `Assigned Employees` | Text | `assigned_employees[].first_name last_name` |
-| `Last Job Note` | Text | last item in `notes[].content` |
-| `Checklist Complete` | Checkbox | `checklist_completed_at` |
-
-These columns are Notion-only and are never touched by the sync:
-- `Queue Owner` (Select)
-- `AI Insight` (Text)
-- `Priority` (Select)
-- `Days Stuck` (Formula)
-- `Last Updated` (Last edited time)
+Phase 2 will add:
+```
+NOTION_DATABASE_ID_LEADS=...
+NOTION_DATABASE_ID_ESTIMATES=...
+```
 
 ---
 
@@ -63,60 +62,90 @@ These columns are Notion-only and are never touched by the sync:
 
 - Base URL: `https://api.housecallpro.com`
 - Auth: `Authorization: Token {api_key}`
+- Rate limit: undocumented number, returns `429` with `RateLimit-Reset` (epoch) header
 - Job ID format: `job_d7f80b1866c348e7882416f4992fa657` (prefixed string)
+- Page size: always returns 10 per page regardless of `per_page` param
 
-### Confirmed working endpoints
+### Confirmed endpoints
 
-| Method | Path | Used for |
-|--------|------|----------|
-| GET | `/jobs?page=1&per_page=50` | List all jobs (paginated) |
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET | `/jobs?page=N` | List jobs (10/page, use `total_pages`) |
 | GET | `/jobs/{id}` | Get single job |
 | POST | `/jobs` | Create job |
-| PUT | `/jobs/{id}/schedule` | Update schedule — payload: `{"start_time": "ISO8601"}` |
-| POST | `/jobs/{id}/notes` | Add note — payload: `{"content": "..."}` |
-| DELETE | `/jobs/{id}` | Delete job (untested — may not be supported) |
+| PUT | `/jobs/{id}/schedule` | Update schedule — `{"start_time": "ISO8601"}` |
+| POST | `/jobs/{id}/notes` | Add note — `{"content": "..."}` |
+| DELETE | `/jobs/{id}` | Delete job |
+| GET | `/leads?page=N` | List leads — confirmed working |
+| GET | `/estimates?page=N` | List estimates — confirmed working |
 
 ### HCP API limitations (important)
-There is NO generic `PUT /jobs/{id}` or `PATCH /jobs/{id}` endpoint. General job fields (customer name, address, status) **cannot be updated via the API**. Only schedule and notes can be written back to HCP.
+No generic `PUT /jobs/{id}` or `PATCH /jobs/{id}`. Cannot update customer name, address, status, job type, or assigned employees via API. Only schedule and notes can be written back to HCP from Notion.
+
+---
+
+## Notion — Jobs Database
+
+### Column mapping
+
+| Notion Column | Type | HCP Field |
+|---------------|------|-----------|
+| `Job #` | Title | `invoice_number` |
+| `Job ID` | Text | `id` — dedup key |
+| `Customer Name` | Text | `customer.first_name + last_name` |
+| `Phone` | Phone | `customer.mobile_number` |
+| `Address` | Text | `address.street, city, state, zip` |
+| `Job status` | Text | `work_status` → mapped to clean name |
+| `Stages` | Select | `work_status` → mapped to clean name |
+| `Job Type` | Select | `job_fields.job_type.name` |
+| `Job scheduled start date` | Date | `schedule.scheduled_start` |
+| `Job created date` | Date | `created_at` |
+| `Assigned Employees` | Text | `assigned_employees[].first_name last_name` |
+| `Last Job Note` | Text | last item in `notes[].content` |
+| `Checklist Complete` | Checkbox | `checklist_completed_at` |
+
+### Stage mapping (HCP raw → Notion)
+
+| HCP `work_status` | Notion `Stages` |
+|-------------------|-----------------|
+| `in progress` | `In Progress` |
+| `scheduled` | `scheduled` |
+| `needs scheduling` | `Lead Intake` |
+| `complete unrated` | `Completed` |
+| `complete rated` | `Completed` |
+| `pro canceled` | `Closed` |
+| `user canceled` | `Closed` |
+
+### Notion-only columns (never touched by sync)
+`Queue Owner`, `AI Insight`, `Priority`, `Days Stuck` (formula), `Last Updated` (system)
 
 ---
 
 ## Sync Logic
 
-### Sync order per cycle (important for loop prevention)
-1. **Notion → HCP** runs first (pushes user edits before HCP overwrites Notion)
-2. **HCP → Notion** runs second (pulls latest HCP state into Notion)
-3. **Timestamp saved** — marks the boundary so next cycle only picks up new edits
+### Cycle order (loop prevention)
+1. **Notion → HCP** — pushes user edits before HCP can overwrite them
+2. **HCP → Notion** — pulls latest HCP state
+3. **Save timestamp** — boundary for next cycle's change detection
 
 ### HCP → Notion
-- Fetches all jobs from HCP (paginated)
-- Creates or updates Notion rows matched by `Job ID`
-- If a Notion row has a `Job ID` that no longer exists in HCP → archives the Notion page
+- Fetches all jobs paginated via `total_pages`
+- Upserts each job to Notion matched by `Job ID`
+- On full sync only: archives Notion pages whose `Job ID` no longer exists in HCP
 
 ### Notion → HCP
-
-**New page (Job ID empty):**
-- Creates a new job in HCP
-- Writes the returned HCP `id` back to the `Job ID` field
-
-**Existing page (has Job ID, edited since last sync):**
-- Updates schedule via `PUT /jobs/{id}/schedule` (if `Job scheduled start date` is set)
-- Adds a note via `POST /jobs/{id}/notes` (only if `Last Job Note` content changed — tracked in `sync_state.json` to avoid duplicate notes)
-
-**Deleted page:**
-- Tracked pages are stored in `sync_state.json`
-- If a tracked page disappears from Notion, calls `DELETE /jobs/{id}` on HCP
+- New page (no Job ID) → `POST /jobs` → writes HCP ID back to Notion
+- Existing page edited since last sync → `PUT /jobs/{id}/schedule` + `POST /jobs/{id}/notes` (if note changed)
+- Deleted page (in `tracked_pages` but gone from Notion) → `DELETE /jobs/{id}`
 
 ### Loop prevention
-- Notion → HCP runs before HCP → Notion in each cycle
-- After HCP → Notion writes to Notion pages, the timestamp is saved
-- Next cycle's Notion → HCP only picks up pages with `last_edited_time > last_sync`, so pages written by HCP → Notion are ignored
+Notion → HCP runs before HCP → Notion. After HCP → Notion writes pages, timestamp is saved. Next cycle's filter (`last_edited_time > last_sync`) skips those pages.
 
 ---
 
 ## State File (sync_state.json)
 
-Auto-generated, gitignored. Contains:
+Auto-generated, gitignored:
 
 ```json
 {
@@ -135,18 +164,51 @@ Auto-generated, gitignored. Contains:
 ## Running
 
 ```bash
-# Install dependencies
-pip install -r requirements.txt
-
-# Sync once and exit
+# One-time full sync (ignores business hours)
 python main.py --once
 
-# Poll continuously every 5 minutes
-python main.py --interval 5
-
-# Custom interval (e.g. every 10 minutes)
-python main.py --interval 10
+# Automated loop: page-1 every 5 min, full scan every 60 min, 9 AM–5 PM ET only
+python main.py
 ```
+
+### Polling schedule
+- **Every 5 min**: page 1 only (~10 jobs, catches new jobs fast)
+- **Every 60 min**: all pages (~320 jobs, catches updates + deletions)
+- **Outside 9 AM–5 PM ET**: sleeps until next 9 AM
+
+---
+
+## Phase 2 Plan — Leads & Estimates
+
+### HCP data available
+- **Leads** (`/leads`): `id`, `number`, `customer`, `address`, `lead_source`, `status`, `pipeline_status`, `tags`, `total_amount`, `assigned_employee`, `conversions`, `job_fields`
+- **Estimates** (`/estimates`): `id`, `estimate_number`, `work_status`, `customer`, `address`, `schedule`, `assigned_employees`, `options`, `estimate_fields`, `lead_source`
+
+### Proposed Notion databases
+
+**Leads DB** columns:
+`Lead #` (title), `Lead ID` (text, dedup), `Customer Name`, `Phone`, `Address`, `Lead Source`, `Status`, `Pipeline Status`, `Tags`, `Total Amount`, `Assigned Employee`
+
+**Estimates DB** columns:
+`Estimate #` (title), `Estimate ID` (text, dedup), `Customer Name`, `Phone`, `Address`, `Status`, `Schedule`, `Assigned Employees`, `Lead Source`, `Options Count`, `Total Amount`
+
+### Relations (to set up in Notion)
+- Estimates → Customers (via Customer Name match)
+- Jobs → Estimates (via `original_estimate_id` field on jobs)
+
+### Notion env vars needed
+Add to `.env`:
+```
+NOTION_DATABASE_ID_LEADS=...
+NOTION_DATABASE_ID_ESTIMATES=...
+```
+
+### Code changes needed
+1. Add `list_leads()` and `list_estimates()` to `hcp.py`
+2. Create `NotionLeadsDB` and `NotionEstimatesDB` classes (or generalize `NotionJobsDB`)
+3. Add `hcp_lead_to_notion_props()` and `hcp_estimate_to_notion_props()` to `sync.py`
+4. Add `sync_hcp_leads_to_notion()` and `sync_hcp_estimates_to_notion()` to `sync.py`
+5. Wire into `run_once()` in `main.py`
 
 ---
 
@@ -159,15 +221,16 @@ No server needed — just a machine that stays on.
 | Local always-on machine | Free |
 | Railway | ~$1–5/month |
 | Render | ~$7/month |
-| AWS Lambda + EventBridge (5-min cron) | Free tier |
+| AWS Lambda + EventBridge | Free tier |
 
-Start command for any host: `python main.py --interval 5`
+Start command: `python main.py`
 
 ---
 
 ## Known Limitations
 
-1. HCP API has no generic job update endpoint — only schedule and notes can be written back from Notion to HCP
-2. Job deletion from HCP → Notion archives the Notion page (recoverable from Notion trash)
-3. Job deletion from Notion → HCP calls DELETE on HCP (untested — verify HCP supports it before relying on this)
-4. Notes in Notion (`Last Job Note`) only shows the most recent note from HCP; adding a note from Notion appends to HCP but doesn't overwrite existing notes
+1. HCP API has no generic job update endpoint — only schedule and notes can be written from Notion → HCP
+2. HCP always returns 10 jobs/page regardless of `per_page` param
+3. Notes in `Last Job Note` shows the most recent HCP note; adding from Notion appends a new note (doesn't overwrite)
+4. Job deletion Notion → HCP calls `DELETE /jobs/{id}` — verify HCP supports this before relying on it
+5. Notion API rate limit: 3 req/sec (Notion returns 429 with `Retry-After` header if exceeded)
