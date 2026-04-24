@@ -1,7 +1,7 @@
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from notion_db import NotionJobsDB
+from notion_db import NotionDB, NotionJobsDB
 
 SYNC_STATE_FILE = Path("sync_state.json")
 
@@ -41,6 +41,14 @@ def save_last_notes(last_notes: dict):
     state["last_notes"] = last_notes
     _save_state(state)
 
+def load_last_schedules():
+    return _load_state().get("last_schedules", {})
+
+def save_last_schedules(last_schedules: dict):
+    state = _load_state()
+    state["last_schedules"] = last_schedules
+    _save_state(state)
+
 
 # ── property helpers ───────────────────────────────────────────────────────────
 
@@ -66,6 +74,16 @@ def _get_date(props, name):
     d = (props.get(name) or {}).get("date")
     return d.get("start") if isinstance(d, dict) else None
 
+
+STAGE_MAP = {
+    "in progress":       "In Progress",
+    "scheduled":         "scheduled",
+    "needs scheduling":  "Lead Intake",
+    "complete unrated":  "Completed",
+    "complete rated":    "Completed",
+    "pro canceled":      "Closed",
+    "user canceled":     "Closed",
+}
 
 # ── HCP → Notion mapping ───────────────────────────────────────────────────────
 
@@ -108,13 +126,14 @@ def hcp_job_to_notion_props(job):
         "Job ID":             {"rich_text": _text(job["id"])},
         "Customer Name":      {"rich_text": _text(customer_name)},
         "Address":            {"rich_text": _text(address)},
-        "Job status":         {"rich_text": _text(work_status)},
+        "Job status":         {"rich_text": _text(STAGE_MAP.get(work_status, work_status))},
         "Checklist Complete": {"checkbox": checklist_complete},
     }
     if phone:
         props["Phone"] = {"phone_number": phone}
-    if work_status:
-        props["Stages"] = {"select": {"name": work_status}}
+    stage = STAGE_MAP.get(work_status)
+    if stage:
+        props["Stages"] = {"select": {"name": stage}}
     if job_type:
         props["Job Type"] = {"select": {"name": job_type}}
     if scheduled_start:
@@ -174,6 +193,7 @@ def sync_notion_to_hcp(notion: NotionJobsDB, hcp):
     last_sync = load_last_sync()
     tracked = load_tracked_pages()
     last_notes = load_last_notes()
+    last_schedules = load_last_schedules()
     print(f"Notion -> HCP (changes since: {last_sync or 'never'}) ...")
     created = updated = deleted = skipped = errors = 0
 
@@ -217,12 +237,16 @@ def sync_notion_to_hcp(notion: NotionJobsDB, hcp):
             job_errors = 0
 
             scheduled = _get_date(props, "Job scheduled start date")
-            if scheduled:
+            if scheduled and scheduled != last_schedules.get(existing_hcp_id):
                 try:
                     hcp.update_job_schedule(existing_hcp_id, scheduled)
+                    last_schedules[existing_hcp_id] = scheduled
                 except Exception as e:
-                    print(f"  Schedule update failed for {existing_hcp_id}: {e}")
-                    job_errors += 1
+                    if "400" in str(e):
+                        pass  # completed/closed jobs can't be rescheduled
+                    else:
+                        print(f"  Schedule update failed for {existing_hcp_id}: {e}")
+                        job_errors += 1
 
             note = _get_rich_text(props, "Last Job Note")
             if note and note != last_notes.get(existing_hcp_id):
@@ -249,7 +273,7 @@ def sync_notion_to_hcp(notion: NotionJobsDB, hcp):
                 result = hcp.create_job(payload)
                 hcp_id = result.get("id")
                 if hcp_id:
-                    notion.set_hcp_id(page_id, hcp_id)
+                    notion.set_id(page_id, hcp_id)
                     tracked[page_id] = hcp_id
                 created += 1
             except Exception as e:
@@ -258,23 +282,35 @@ def sync_notion_to_hcp(notion: NotionJobsDB, hcp):
 
     save_tracked_pages(tracked)
     save_last_notes(last_notes)
+    save_last_schedules(last_schedules)
     print(f"  {created} created, {updated} updated, {deleted} deleted in HCP, {skipped} skipped, {errors} errors")
 
 
-def sync_hcp_to_notion(hcp, notion: NotionJobsDB):
-    print("HCP -> Notion ...")
+def sync_hcp_to_notion(hcp, notion: NotionJobsDB, max_pages=None):
+    label = f"pages 1-{max_pages}" if max_pages else "all pages"
+    print(f"HCP -> Notion ({label}) ...")
     page_num = 1
+    total_pages = 1
     all_hcp_ids = set()
     created = updated = deleted = errors = 0
+    full_sync = max_pages is None
+    last_schedules = load_last_schedules()
 
-    while True:
+    while page_num <= total_pages:
+        if max_pages and page_num > max_pages:
+            break
         try:
             data = hcp.list_jobs(page=page_num, per_page=50)
         except Exception as e:
             print(f"  Failed to fetch page {page_num} from HCP: {e}")
             break
 
-        jobs = data if isinstance(data, list) else (data.get("jobs") or data.get("data") or [])
+        if isinstance(data, dict):
+            total_pages = data.get("total_pages", 1)
+            jobs = data.get("jobs") or data.get("data") or []
+        else:
+            jobs = data or []
+
         if not jobs:
             break
 
@@ -287,16 +323,19 @@ def sync_hcp_to_notion(hcp, notion: NotionJobsDB):
                     created += 1
                 else:
                     updated += 1
+                schedule = job.get("schedule") or {}
+                sched_start = schedule.get("scheduled_start") if isinstance(schedule, dict) else None
+                if sched_start:
+                    last_schedules[str(job["id"])] = sched_start
             except Exception as e:
                 print(f"  Job {job.get('id')}: {e}")
                 errors += 1
 
-        if isinstance(data, list) or len(jobs) < 50:
-            break
+        print(f"  Page {page_num}/{total_pages} done ({created} created, {updated} updated so far)")
         page_num += 1
 
-    # Archive Notion pages whose HCP job was deleted
-    if all_hcp_ids:
+    # Only check for deletions on a full sync (we have all HCP IDs)
+    if full_sync and all_hcp_ids:
         for page in notion.get_all_pages_with_job_id():
             hcp_id = _get_rich_text(page.get("properties", {}), "Job ID")
             if hcp_id and hcp_id not in all_hcp_ids:
@@ -308,4 +347,196 @@ def sync_hcp_to_notion(hcp, notion: NotionJobsDB):
                     print(f"  Could not archive page for job {hcp_id}: {e}")
                     errors += 1
 
+    save_last_schedules(last_schedules)
     print(f"  {created} created, {updated} updated, {deleted} archived, {errors} errors")
+
+
+# ── leads mapping ──────────────────────────────────────────────────────────────
+
+def hcp_lead_to_notion_props(lead):
+    customer = lead.get("customer") or {}
+    customer_name = f"{customer.get('first_name', '')} {customer.get('last_name', '')}".strip()
+    phone = customer.get("mobile_number") or ""
+    email = customer.get("email") or ""
+
+    addr = lead.get("address") or {}
+    if isinstance(addr, dict):
+        parts = [addr.get("street"), addr.get("city"), addr.get("state"), addr.get("zip")]
+        address = ", ".join(p for p in parts if p)
+    else:
+        address = str(addr) if addr else ""
+
+    employee = lead.get("assigned_employee") or {}
+    employee_name = (
+        f"{employee.get('first_name', '')} {employee.get('last_name', '')}".strip()
+        if isinstance(employee, dict) else ""
+    )
+
+    tags = lead.get("tags") or []
+    tag_names = [t.get("name", t) if isinstance(t, dict) else str(t) for t in tags]
+
+    status = lead.get("status") or ""
+    pipeline_status = lead.get("pipeline_status") or ""
+    lead_source = lead.get("lead_source") or ""
+    total_amount = lead.get("total_amount") or 0
+
+    props = {
+        "Lead #":        {"title": _text(f"Lead #{lead['number']}")},
+        "Lead ID":       {"rich_text": _text(lead["id"])},
+        "Customer Name": {"rich_text": _text(customer_name)},
+        "Address":       {"rich_text": _text(address)},
+        "Total Amount":  {"number": total_amount},
+    }
+    if phone:
+        props["Phone"] = {"phone_number": phone}
+    if email:
+        props["Email"] = {"email": email}
+    if status:
+        props["Status"] = {"select": {"name": status}}
+    if pipeline_status:
+        props["Pipeline Status"] = {"select": {"name": pipeline_status}}
+    if lead_source:
+        props["Lead Source"] = {"select": {"name": lead_source}}
+    if employee_name:
+        props["Assigned Employee"] = {"rich_text": _text(employee_name)}
+    if tag_names:
+        props["Tags"] = {"multi_select": [{"name": t} for t in tag_names]}
+    return props
+
+
+# ── estimates mapping ──────────────────────────────────────────────────────────
+
+def hcp_estimate_to_notion_props(estimate):
+    customer = estimate.get("customer") or {}
+    customer_name = f"{customer.get('first_name', '')} {customer.get('last_name', '')}".strip()
+    phone = customer.get("mobile_number") or ""
+    email = customer.get("email") or ""
+
+    addr = estimate.get("address") or {}
+    if isinstance(addr, dict):
+        parts = [addr.get("street"), addr.get("city"), addr.get("state"), addr.get("zip")]
+        address = ", ".join(p for p in parts if p)
+    else:
+        address = str(addr) if addr else ""
+
+    employees = estimate.get("assigned_employees") or []
+    employee_names = ", ".join(
+        f"{e.get('first_name', '')} {e.get('last_name', '')}".strip()
+        for e in employees if isinstance(e, dict)
+    )
+
+    schedule = estimate.get("schedule") or {}
+    scheduled_start = schedule.get("scheduled_start") if isinstance(schedule, dict) else None
+
+    options = estimate.get("options") or []
+    total_amount = sum(o.get("total_amount", 0) for o in options) if options else 0
+
+    notes = ""
+    if options:
+        option_notes = options[0].get("notes") or []
+        if option_notes:
+            notes = option_notes[-1].get("content", "")
+
+    work_status = estimate.get("work_status") or ""
+    lead_source = estimate.get("lead_source") or ""
+    job_type = ((estimate.get("estimate_fields") or {}).get("job_type") or {}).get("name") or ""
+
+    props = {
+        "Estimate #":    {"title": _text(estimate["estimate_number"])},
+        "Estimate ID":   {"rich_text": _text(estimate["id"])},
+        "Customer Name": {"rich_text": _text(customer_name)},
+        "Address":       {"rich_text": _text(address)},
+    }
+    if phone:
+        props["Phone"] = {"phone_number": phone}
+    if email:
+        props["Email"] = {"email": email}
+    if work_status:
+        props["Status"] = {"select": {"name": work_status}}
+    if lead_source:
+        props["Lead Source"] = {"select": {"name": lead_source}}
+    if job_type:
+        props["Job Type"] = {"select": {"name": job_type}}
+    if scheduled_start:
+        props["Scheduled"] = {"date": {"start": scheduled_start}}
+    if employee_names:
+        props["Assigned Employees"] = {"rich_text": _text(employee_names)}
+    if notes:
+        props["Notes"] = {"rich_text": _text(notes[:2000])}
+    if total_amount:
+        props["Total Amount"] = {"number": total_amount}
+    return props
+
+
+# ── leads sync ─────────────────────────────────────────────────────────────────
+
+def sync_hcp_leads_to_notion(hcp, notion: NotionDB):
+    print("HCP -> Notion (leads) ...")
+    page_num = 1
+    total_pages = 1
+    created = updated = errors = 0
+
+    while page_num <= total_pages:
+        try:
+            data = hcp.list_leads(page=page_num)
+        except Exception as e:
+            print(f"  Failed to fetch leads page {page_num}: {e}")
+            break
+
+        total_pages = data.get("total_pages", 1)
+        leads = data.get("leads") or []
+        if not leads:
+            break
+
+        for lead in leads:
+            try:
+                props = hcp_lead_to_notion_props(lead)
+                action, _ = notion.upsert(lead["id"], props)
+                if action == "created":
+                    created += 1
+                else:
+                    updated += 1
+            except Exception as e:
+                print(f"  Lead {lead.get('id')}: {e}")
+                errors += 1
+
+        page_num += 1
+
+    print(f"  {created} created, {updated} updated, {errors} errors")
+
+
+# ── estimates sync ─────────────────────────────────────────────────────────────
+
+def sync_hcp_estimates_to_notion(hcp, notion: NotionDB):
+    print("HCP -> Notion (estimates) ...")
+    page_num = 1
+    total_pages = 1
+    created = updated = errors = 0
+
+    while page_num <= total_pages:
+        try:
+            data = hcp.list_estimates(page=page_num)
+        except Exception as e:
+            print(f"  Failed to fetch estimates page {page_num}: {e}")
+            break
+
+        total_pages = data.get("total_pages", 1)
+        estimates = data.get("estimates") or []
+        if not estimates:
+            break
+
+        for estimate in estimates:
+            try:
+                props = hcp_estimate_to_notion_props(estimate)
+                action, _ = notion.upsert(estimate["id"], props)
+                if action == "created":
+                    created += 1
+                else:
+                    updated += 1
+            except Exception as e:
+                print(f"  Estimate {estimate.get('id')}: {e}")
+                errors += 1
+
+        page_num += 1
+
+    print(f"  {created} created, {updated} updated, {errors} errors")
