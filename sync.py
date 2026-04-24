@@ -85,6 +85,21 @@ STAGE_MAP = {
     "user canceled":     "Closed",
 }
 
+ESTIMATE_STATUS_MAP = {
+    # approval_status values (from options[0])
+    "pro approved":              "Pro Approved",
+    "pro declined":              "Pro Declined",
+    "approved":                  "Approved",
+    "expired":                   "Expired",
+    # option status values (fallback when approval_status is None)
+    "submitted for signoff":     "Awaiting Approval",
+    "created job from estimate": "Job Created",
+    "scheduled":                 "Scheduled",
+    "needs scheduling":          "Needs Scheduling",
+    "canceled":                  "Canceled",
+    "deleted":                   "Deleted",
+}
+
 # ── HCP → Notion mapping ───────────────────────────────────────────────────────
 
 def hcp_job_to_notion_props(job):
@@ -437,7 +452,8 @@ def hcp_estimate_to_notion_props(estimate):
         if option_notes:
             notes = option_notes[-1].get("content", "")
 
-    work_status = estimate.get("work_status") or ""
+    first_opt = options[0] if options else {}
+    raw_status = first_opt.get("approval_status") or first_opt.get("status") or estimate.get("work_status") or ""
     lead_source = estimate.get("lead_source") or ""
     job_type = ((estimate.get("estimate_fields") or {}).get("job_type") or {}).get("name") or ""
 
@@ -451,8 +467,8 @@ def hcp_estimate_to_notion_props(estimate):
         props["Phone"] = {"phone_number": phone}
     if email:
         props["Email"] = {"email": email}
-    if work_status:
-        props["Status"] = {"select": {"name": work_status}}
+    if raw_status:
+        props["Status"] = {"select": {"name": ESTIMATE_STATUS_MAP.get(raw_status, raw_status)}}
     if lead_source:
         props["Lead Source"] = {"select": {"name": lead_source}}
     if job_type:
